@@ -75,6 +75,115 @@ pluralisation_of_axes = {
     ),
 }
 
+# Non-ionising wavelength band (Angstrom) used to normalise each cloudy run to
+# its input spectrum. Cloudy reproduces the input SED here, unlike at the
+# ionisation edges, where it depends on how the input is sampled.
+NORMALISATION_BAND = (1500.0, 5000.0)
+
+# Warn if the Q of a normalised incident spectrum differs from the incident
+# grid's stored Q by more than this (dex)
+Q_CONSISTENCY_TOLERANCE_DEX = 0.02
+
+
+def band_luminosity(lam, lnu, band=NORMALISATION_BAND):
+    """Integrate L_nu over a wavelength band.
+
+    The band edges are interpolated, so the result does not depend on where
+    the grid's points fall relative to them.
+
+    Args:
+        lam (np.ndarray):
+            Wavelengths in Angstrom, increasing, along the last axis of lnu.
+        lnu (np.ndarray):
+            Spectral luminosity density, shape (..., len(lam)).
+        band (tuple of float):
+            The (lower, upper) wavelength limits in Angstrom.
+
+    Returns:
+        np.ndarray or float:
+            The integral of lnu over the band (lnu units x Angstrom), with
+            the leading shape of lnu.
+    """
+    lo, hi = band
+    lnu = np.asarray(lnu, dtype=float)
+    inside = (lam > lo) & (lam < hi)
+    flat = lnu.reshape(-1, lnu.shape[-1])
+    y_lo = np.array([np.interp(lo, lam, row) for row in flat])
+    y_hi = np.array([np.interp(hi, lam, row) for row in flat])
+    x = np.concatenate([[lo], lam[inside], [hi]])
+    y = np.concatenate([y_lo[:, None], flat[:, inside], y_hi[:, None]], axis=1)
+    out = np.trapezoid(y, x, axis=1).reshape(lnu.shape[:-1])
+    return out if out.ndim else float(out)
+
+
+def continuum_normalisation(
+    cloudy_lam,
+    cloudy_incident,
+    input_band_luminosity,
+    band=NORMALISATION_BAND,
+):
+    """Normalisation that matches a cloudy run to its input spectrum.
+
+    Cloudy rescales the input SED to the requested ionisation parameter. This
+    returns the factor that maps its outputs back to the units of the input
+    grid, by matching the incident continuum in a non-ionising band. Unlike
+    matching the ionising photon rate Q, this doesn't depend on how the input
+    samples the ionisation edges (see syncretize#151).
+
+    Args:
+        cloudy_lam (np.ndarray):
+            Cloudy's wavelengths in Angstrom (increasing).
+        cloudy_incident (np.ndarray):
+            Cloudy's incident L_nu at cloudy_lam.
+        input_band_luminosity (float):
+            band_luminosity of the input spectrum for this grid point.
+        band (tuple of float):
+            The (lower, upper) wavelength limits in Angstrom.
+
+    Returns:
+        float or None:
+            The normalisation, or None if either spectrum has no flux in the
+            band (e.g. ionising-only incident grids), in which case the
+            caller should fall back to another normalisation.
+    """
+    cloudy_band = band_luminosity(cloudy_lam, cloudy_incident, band)
+    if not (
+        np.isfinite(input_band_luminosity)
+        and np.isfinite(cloudy_band)
+        and input_band_luminosity > 0
+        and cloudy_band > 0
+    ):
+        return None
+    return float(input_band_luminosity / cloudy_band)
+
+
+def read_incident_band_luminosity(incident_grid_file, band=NORMALISATION_BAND):
+    """Read the band luminosity of every spectrum in an incident grid file.
+
+    The spectra are read straight from the file, not from a loaded Grid,
+    because synthesizer rescales luminosity weighted grids on load and the
+    cloudy outputs must be matched to the values stored in the file.
+
+    Args:
+        incident_grid_file (str):
+            Path to the incident grid HDF5 file.
+        band (tuple of float):
+            The (lower, upper) wavelength limits in Angstrom.
+
+    Returns:
+        np.ndarray or None:
+            The band luminosity, with the incident grid's axes shape, or None
+            if the incident grid doesn't cover the band.
+    """
+    with h5py.File(incident_grid_file, "r") as hf:
+        lam = hf["spectra/wavelength"][...]
+        if lam[0] > band[0] or lam[-1] < band[1]:
+            return None
+        i0 = max(int(np.searchsorted(lam, band[0])) - 1, 0)
+        i1 = min(int(np.searchsorted(lam, band[1])) + 1, len(lam))
+        lnu = hf["spectra/incident"][..., i0:i1]
+    return band_luminosity(lam[i0:i1], lnu, band)
+
 
 def create_empty_grid(
     grid_dir,
@@ -457,9 +566,15 @@ def add_spectra(
     new_shape,
     spec_names=("incident", "transmitted", "nebular", "linecont"),
     norm_by_q=True,
+    norm_method="continuum",
+    incident_band_luminosity=None,
 ):
     """
     Open cloudy spectra and add them to the grid.
+
+    Each cloudy run is rescaled by a single factor (applied to all spectra and,
+    via spectra["normalisation"], to the line luminosities) that maps it back
+    to the units of the incident grid.
 
     Args:
         new_grid (GridFile)
@@ -478,9 +593,34 @@ def add_spectra(
         shape (ndarray)
             The shape of the new grid.
         norm_by_q (bool)
-            If True, the spectra are normalised by the specific ionising
-            photon luminosity calculated from the incident spectrum.
+            Deprecated, kept for backwards compatibility. False disables
+            normalisation entirely (same as norm_method=None).
+        norm_method (str or None)
+            How to normalise each run:
+            "continuum" (default): match cloudy's incident spectrum to the
+            input over NORMALISATION_BAND (needs incident_band_luminosity).
+            Falls back to "q" for grid points with no flux in the band.
+            "q": match the ionising photon rate Q(HI) of cloudy's incident
+            spectrum to the incident grid's stored value. This is the
+            previous behaviour; it is sensitive to how the input samples
+            the ionisation edges (syncretize#151).
+            None: no normalisation.
+        incident_band_luminosity (np.ndarray)
+            band_luminosity of each incident grid spectrum (incident grid
+            shape), see read_incident_band_luminosity.
     """
+    if not norm_by_q:
+        norm_method = None
+    if norm_method not in ("continuum", "q", None):
+        raise ValueError(f"Unknown norm_method: {norm_method}")
+    if norm_method == "continuum" and incident_band_luminosity is None:
+        print(
+            "No incident band luminosities available; normalising by Q "
+            "instead of the continuum."
+        )
+        norm_method = "q"
+    n_q_fallback = 0
+    q_offsets = []
 
     # Determine the cloudy version...
     cloudy_version = new_grid.read_attribute(
@@ -551,9 +691,21 @@ def add_spectra(
                 # Read the continuum file containing the spectra
                 spec_dict = cloudy.read_continuum(infile, return_dict=True)
 
-                # Calculate the specific ionising photon luminosity and use
-                # this to renormalise the spectrum.
-                if norm_by_q:
+                # Work out the factor that maps this run back to the units of
+                # the incident grid
+                normalisation = None
+                if norm_method == "continuum":
+                    normalisation = continuum_normalisation(
+                        lam,
+                        spec_dict["incident"],
+                        incident_band_luminosity[tuple(incident_index_tuple)],
+                    )
+                    if normalisation is None:
+                        n_q_fallback += 1
+
+                # Q normalisation: requested, or as the fallback for points
+                # with no continuum in the band. Also used as a diagnostic.
+                if norm_method is not None:
                     # Create sed object
                     sed = Sed(
                         lam=lam * Angstrom,
@@ -566,15 +718,25 @@ def add_spectra(
                             ionisation_energy=13.6 * eV, limit=100
                         )
                     )
-
-                    # Calculate normalisation
-                    normalisation = new_grid.read_dataset(
+                    log10_q_stored = new_grid.read_dataset(
                         "log10_specific_ionising_luminosity/HI",
                         indices=indices,
-                    ) - np.log10(ionising_photon_production_rate)
+                    )
+                    log10_q_norm = log10_q_stored - np.log10(
+                        ionising_photon_production_rate
+                    )
+
+                    if normalisation is None:
+                        normalisation = 10**log10_q_norm
+                    elif np.isfinite(log10_q_norm):
+                        # How far the Q of the continuum-normalised incident
+                        # spectrum is from the stored Q (dex)
+                        q_offsets.append(
+                            float(log10_q_norm - np.log10(normalisation))
+                        )
 
                     # Save normalisation for later use (rescaling lines)
-                    spectra["normalisation"][indices] = 10**normalisation
+                    spectra["normalisation"][indices] = normalisation
 
                 # Save the normalised spectrum to the correct grid point
                 for spec_name in spec_names:
@@ -582,6 +744,30 @@ def add_spectra(
                         spec_dict[spec_name]
                         * spectra["normalisation"][indices]
                     )
+
+    # Report on the normalisation
+    if norm_method == "continuum":
+        if n_q_fallback:
+            print(
+                f"{n_q_fallback} grid points had no incident continuum in "
+                f"{NORMALISATION_BAND} A and were normalised by Q instead."
+            )
+        if q_offsets:
+            worst = float(np.max(np.abs(q_offsets)))
+            print(
+                "Continuum-normalised incident spectra vs stored Q: max "
+                f"|offset| = {worst:.3f} dex, median "
+                f"{np.median(np.abs(q_offsets)):.3f} dex."
+            )
+            if worst > Q_CONSISTENCY_TOLERANCE_DEX:
+                print(
+                    "WARNING: the ionising photon rate of some normalised "
+                    "incident spectra differs from the incident grid's stored "
+                    f"Q by more than {Q_CONSISTENCY_TOLERANCE_DEX} dex. The "
+                    "incident grid may sample its ionising spectrum too "
+                    "coarsely (e.g. around the 912 A edge); the stellar "
+                    "continuum is still normalised correctly."
+                )
 
     # Apply units to the spectra
     for spec in spectra:
@@ -1027,6 +1213,12 @@ if __name__ == "__main__":
 
     # Now add spectra.
     if include_spectra:
+        # Band luminosity of each input spectrum, read from the file, used to
+        # normalise each cloudy run back to the incident grid's units
+        incident_band_luminosity = read_incident_band_luminosity(
+            incident_grid.grid_filename
+        )
+
         lam, spectra = add_spectra(
             new_grid,
             new_grid_name,
@@ -1035,7 +1227,8 @@ if __name__ == "__main__":
             photoionisation_index_list,
             new_shape,
             spec_names=("incident", "transmitted", "nebular", "linecont"),
-            norm_by_q=True,
+            norm_method="continuum",
+            incident_band_luminosity=incident_band_luminosity,
         )
         print("Added spectra")
         print(spectra.keys())
